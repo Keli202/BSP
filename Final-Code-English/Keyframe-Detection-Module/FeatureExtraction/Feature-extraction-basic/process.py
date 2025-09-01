@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+Purpose
+-------
+Prepare frame-level arrays from raw ultrasound videos and binary labels from
+frame-wise masks. This is the "no-highlight" path used to extract features
+directly from original images.
+
+Context
+-------
+In the Structural-Prior Segmentation Module we also generated nnU-Net masks
+as a structural prior. Those predicted masks are used in the *with-highlight*
+pipeline, not here. Earlier in the project, GT labels were briefly overwritten
+by predicted masks and later restored by a separate script. This script does
+not alter that logic; it simply reads the current masks and produces labels.
+
+Path Policy
+-----------
+- Defaults assume this file lives under the repo and data are under:
+    data/acouslic/images/stacked_fetal_ultrasound/
+    data/acouslic/masks/stacked_fetal_abdomen/
+- Override with env vars if needed:
+    PROJECT_ROOT, DATA_ROOT
+"""
+
+import os
+import numpy as np
+import torch
+import SimpleITK as sitk
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+# ---------- repo-friendly paths (unchanged logic) ----------
+REPO_ROOT = Path(os.getenv("PROJECT_ROOT", Path(__file__).resolve().parents[3]))
+DATA_ROOT = Path(os.getenv("DATA_ROOT", REPO_ROOT / "data"))
+
+# Raw image/mask folders (no-highlight path)
+DEFAULT_IMAGE_DIR = DATA_ROOT / "acouslic" / "images" / "stacked_fetal_ultrasound"
+DEFAULT_MASK_DIR  = DATA_ROOT / "acouslic" / "masks"  / "stacked_fetal_abdomen"
+
+# Output root for NPZs used by downstream feature extraction
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data" / "processed_features"
+
+# ========== global flags (kept as-is) ==========
+USE_SMALL_SUBSET = False     # use a subset only
+SUBSET_RATIO = 1.0           # fraction to take when USE_SMALL_SUBSET=True
+
+def load_mha(file_path):
+    image = sitk.ReadImage(file_path)
+    return sitk.GetArrayFromImage(image).astype(np.float32)  # (T, H, W)
+
+def get_frame_labels(mask_array):
+    """
+    Merge keyframe(1) and sub-keyframe(2) into one positive class (1).
+    Background is 0.
+    """
+    labels = np.zeros(mask_array.shape[0], dtype=int)
+    for i, frame in enumerate(mask_array):
+        if 1 in frame or 2 in frame:
+            labels[i] = 1
+        else:
+            labels[i] = 0
+    return labels
+
+def enhance_images(images, masks, highlight_factor=0.15):
+    """
+    Optional visual highlight (NOT used in this basic pipeline by default).
+    To enable, uncomment the call in process_video().
+    """
+    masked_images = images.copy()
+    masked_images[masks > 0] = (
+        masked_images[masks > 0] * (1 - highlight_factor) + highlight_factor * 255
+    )
+    return masked_images
+
+def process_video(image_path, mask_path):
+    images = load_mha(image_path)
+    masks = load_mha(mask_path)
+    labels = get_frame_labels(masks)  # binary labels only (1 = key/sub-key)
+    # enhanced_images = enhance_images(images, masks)  # enable if highlight is desired
+    # return enhanced_images, labels
+    return images, labels
+
+def split_dataset(file_list, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    train_files, temp_files = train_test_split(file_list, train_size=train_ratio, random_state=seed)
+    val_files, test_files = train_test_split(temp_files, test_size=test_ratio/(val_ratio + test_ratio), random_state=seed)
+    return train_files, val_files, test_files
+
+# ========== multiprocess worker (unchanged) ==========
+def process_one(args):
+    filename, image_dir, mask_dir, split_dir = args
+    img_path = os.path.join(image_dir, filename)
+    mask_path = os.path.join(mask_dir, filename)
+    save_path = os.path.join(split_dir, filename.replace('.mha', '.npz'))
+    try:
+        images, labels = process_video(img_path, mask_path)
+        np.savez_compressed(save_path, images=images, labels=labels)
+        return None
+    except Exception as e:
+        print(f"[Error] Failed processing {filename}: {e}")
+        with open("process_errors.txt", "a") as ferr:
+            ferr.write(f"{filename}\n")
+        return filename
+
+# ========== main ==========
+if __name__ == "__main__":
+    image_dir = str(os.getenv("IMAGE_DIR", DEFAULT_IMAGE_DIR))
+    mask_dir  = str(os.getenv("MASK_DIR",  DEFAULT_MASK_DIR))
+    output_root = str(os.getenv("OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT))
+
+    os.makedirs(output_root, exist_ok=True)
+
+    all_filenames = [f for f in os.listdir(image_dir)
+                     if f.endswith('.mha') and os.path.exists(os.path.join(mask_dir, f))]
+    all_filenames = sorted(all_filenames)
+
+    if USE_SMALL_SUBSET:
+        subset_len = max(1, int(len(all_filenames) * SUBSET_RATIO))
+        all_filenames = all_filenames[:subset_len]
+        print(f"[INFO] Using small subset: {subset_len} samples / Total: {len(all_filenames)}")
+    else:
+        print(f"[INFO] Using full dataset: {len(all_filenames)} samples.")
+
+    train_set, val_set, test_set = split_dataset(all_filenames)
+    print(f"[INFO] Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
+
+    split_map = {'train': train_set, 'val': val_set, 'test': test_set}
+
+    num_workers = min(8, os.cpu_count() or 1)
+    for split_name, file_list in split_map.items():
+        split_dir = os.path.join(output_root, split_name)
+        os.makedirs(split_dir, exist_ok=True)
+
+        args_list = [(filename, image_dir, mask_dir, split_dir) for filename in file_list]
+        print(f"[INFO] Start processing {split_name} set ({len(args_list)} files, {num_workers} processes)...")
+        from tqdm import tqdm
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            list(tqdm(executor.map(process_one, args_list), total=len(args_list), desc=f"[{split_name}]"))
+
+    print("All splits processed. Done.")
