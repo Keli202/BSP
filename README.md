@@ -1,5 +1,5 @@
 # Dwell-Aware Key-Frame Detection in Blind-Sweep Fetal Ultrasound
-#### Fetal Abdominal Ultrasound Keyframe Detection
+### Fetal Abdominal Ultrasound Keyframe Detection
 
 This repository targets **keyframe detection** in fetal abdominal ultrasound.  
 Run the pipeline in this order:
